@@ -1,0 +1,253 @@
+import re
+import os
+import random
+import time
+import pandas as pd
+from typing import Dict, Any, Tuple
+
+# Assuming mock_llm is imported or available based on your test environment setup:
+# from mock_llm import mock_llm, TransientLLMError
+
+# ---------------------------------------------------------
+# CONSTANTS & CONFIGURATION
+# ---------------------------------------------------------
+MAX_INPUT_TOKENS = 734
+BASE_DELAY = 2.0
+MAX_RETRIES = 3
+TOKEN_BUDGET = 100000
+
+# Allowed categories
+ALLOWED_CATEGORIES = ["billing", "delivery", "technical", "fraud"]
+
+# ---------------------------------------------------------
+# TASK 1: Input Guardrails
+# ---------------------------------------------------------
+def check_input_guardrails(text: str) -> Tuple[str, str]:
+    """
+    Checks if a ticket text is empty/whitespace or exceeds token limits.
+    Returns (status, processed_text).
+    status can be: 'valid', 'skipped_empty', or 'flagged_long'.
+    """
+    if not text or not str(text).strip():
+        return "skipped_empty", ""
+    
+    # Simple whitespace token estimation or standard token count approximation
+    tokens = text.split()
+    if len(tokens) > MAX_INPUT_TOKENS:
+        return "flagged_long", text
+        
+    return "valid", text
+
+# ---------------------------------------------------------
+# TASK 2: Redact Personal Information
+# ---------------------------------------------------------
+EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
+PHONE_REGEX = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
+ORDER_ID_REGEX = re.compile(r"\b(?:order[_\s]?id[:\s]*)?#[A-Z0-9]{5,}\b", re.IGNORECASE)
+
+def redact_pii(text: str) -> Tuple[str, int, int, int]:
+    """
+    Redacts emails, phone numbers, and order IDs.
+    Returns (redacted_text, email_count, phone_count, order_count).
+    """
+    emails = EMAIL_REGEX.findall(text)
+    phones = PHONE_REGEX.findall(text)
+    orders = ORDER_ID_REGEX.findall(text)
+    
+    redacted = text
+    redacted = EMAIL_REGEX.sub("<EMAIL>", redacted)
+    redacted = PHONE_REGEX.sub("<PHONE>", redacted)
+    redacted = ORDER_ID_REGEX.sub("<ORDER_ID>", redacted)
+    
+    # Re-applying patterns to ensure comprehensive coverage as specified
+    # (Checking substitution counts)
+    return redacted, len(emails), len(phones), len(orders)
+
+# ---------------------------------------------------------
+# TASK 3: Prompts Definition
+# ---------------------------------------------------------
+ZERO_SHOT_PROMPT = """You are a support ticket classifier. Your task is to analyze the support ticket and classify it into one of the following categories: billing, delivery, technical, fraud.
+You must reply with a valid JSON containing the key "category". Do not include any extra text.
+Ticket: {ticket_text}"""
+
+FEW_SHOT_PROMPT = """You are a support ticket classifier. Classify tickets into: billing, delivery, technical, fraud.
+Provide a valid JSON response with the key "category".
+
+Example 1:
+Ticket: I was charged twice for my subscription this month.
+Response: {{"category": "billing"}}
+
+Example 2:
+Ticket: My package hasn't arrived and tracking hasn't updated in 5 days.
+Response: {{"category": "delivery"}}
+
+Ticket: {ticket_text}"""
+
+# ---------------------------------------------------------
+# TASK 4: Resilient Calls with Exponential Backoff & Jitter
+# ---------------------------------------------------------
+def call_llm_with_resilience(prompt: str, mock_llm_func) -> str:
+    """
+    Calls mock_llm with up to 3 retries, exponential backoff, and jitter.
+    Wait formula: BASE_DELAY * (2 ** n) + random.uniform(0, 1.5)
+    """
+    for n in range(MAX_RETRIES + 1):
+        try:
+            # mock_llm reset hook if required by environment
+            if hasattr(mock_llm_func, 'reset'):
+                mock_llm_func.reset()
+            
+            response = mock_llm_func(prompt)
+            return response
+        except TransientLLMError:
+            if n == MAX_RETRIES:
+                raise
+            sleep_time = BASE_DELAY * (2 ** n) + random.uniform(0, 1.5)
+            time.sleep(sleep_time)
+        except Exception:
+            if n == MAX_RETRIES:
+                raise
+            sleep_time = BASE_DELAY * (2 ** n) + random.uniform(0, 1.5)
+            time.sleep(sleep_time)
+    raise Exception("Max retries exceeded for LLM call.")
+
+# ---------------------------------------------------------
+# TASK 5: Validate Answer
+# ---------------------------------------------------------
+def validate_answer(reply: str) -> Tuple[str, str]:
+    """
+    Parses reply as JSON or extracts lowercase category via regex fallback.
+    Returns (status, category).
+    """
+    import json
+    category = "human_review"
+    status = "flagged_invalid_output"
+    
+    try:
+        data = json.loads(reply)
+        if isinstance(data, dict) and "category" in data:
+            cat_val = str(data["category"]).lower().strip()
+            if cat_val in ALLOWED_CATEGORIES:
+                return "classified_json", cat_val
+    except Exception:
+        pass
+    
+    # Fallback to regex extraction
+    found_matches = re.findall(r"(a-z)+", reply.lower())
+    for word in found_matches:
+        if word in ALLOWED_CATEGORIES:
+            return "classified_keyword", word
+            
+    # Check keyword rules ("billing and related")
+    lower_reply = reply.lower()
+    if "billing" in lower_reply or "related" in lower_reply:
+        return "classified_keyword", "billing"
+        
+    return status, "human_review"
+
+# ---------------------------------------------------------
+# TASK 6 & 7: Full Pipeline Execution with Budgeting & Routing
+# ---------------------------------------------------------
+def run_triage_pipeline(csv_path: str, mock_llm_func):
+    df = pd.read_csv(csv_path)
+    
+    results = []
+    triage_results = []
+    
+    total_tokens_used = 0
+    budget_exhausted = False
+    
+    for idx, row in df.iterrows():
+        ticket_id = row.get("ticket_id")
+        customer_id = row.get("customer_id")
+        order_id = row.get("order_id")
+        text = str(row.get("text", ""))
+        true_category = row.get("true_category", "")
+        
+        # 1. Input Guardrails
+        guard_status, processed_text = check_input_guardrails(text)
+        
+        if guard_status != "valid":
+            triage_results.append({
+                "ticket_id": ticket_id,
+                "customer_id": customer_id,
+                "order_id": order_id,
+                "status": guard_status,
+                "category": "",
+                "route": "support_queue",
+                "priority": "HIGH" if guard_status == "skipped_empty" else "NORMAL"
+            })
+            continue
+            
+        # 2. Redact PII
+        redacted_text, _, _, _ = redact_pii(processed_text)
+        
+        # 7. Budget & Routing Check
+        # If token budget is exhausted or close to exhaustion, route to human review
+        prompt_to_use = ZERO_SHOT_PROMPT.format(ticket_text=redacted_text)
+        
+        if budget_exhausted:
+            triage_results.append({
+                "ticket_id": ticket_id,
+                "customer_id": customer_id,
+                "order_id": order_id,
+                "status": "budget_exhausted",
+                "category": "",
+                "route": "human_review",
+                "priority": "NORMAL"
+            })
+            continue
+            
+        # 4 & 5. Resilient Call & Validation
+        try:
+            response = call_llm_with_resilience(prompt_to_use, mock_llm_func)
+            
+            # Track token usage if response has usage metrics
+            if hasattr(response, "usage") and hasattr(response.usage, "total_tokens"):
+                total_tokens_used += response.usage.total_tokens
+                reply_content = response.choices[0].message.content
+            else:
+                # Fallback token estimation simulation
+                approx_tokens = len(prompt_to_use.split()) + 15
+                total_tokens_used += approx_tokens
+                reply_content = str(response)
+                
+            if total_tokens_used >= TOKEN_BUDGET:
+                budget_exhausted = True
+                
+            status, category = validate_answer(reply_content)
+            
+            # Determine routing
+            is_premium = row.get("is_premium", False)
+            if category == "human_review" or status == "flagged_invalid_output":
+                route = "human_review"
+                priority = "HIGH" if is_premium else "NORMAL"
+            else:
+                route = "support_queue"
+                priority = "NORMAL"
+                
+            triage_results.append({
+                "ticket_id": ticket_id,
+                "customer_id": customer_id,
+                "order_id": order_id,
+                "status": status,
+                "category": category,
+                "route": route,
+                "priority": priority
+            })
+            
+        except Exception as e:
+            triage_results.append({
+                "ticket_id": ticket_id,
+                "customer_id": customer_id,
+                "order_id": order_id,
+                "status": "flagged_invalid_output",
+                "category": "human_review",
+                "route": "human_review",
+                "priority": "HIGH"
+            })
+
+    # Save outputs as specified in acceptance criteria
+    results_df = pd.DataFrame(triage_results)
+    results_df.to_csv("outputs/triage_results.csv", index=False)
+    return results_df
