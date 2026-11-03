@@ -1,0 +1,241 @@
+project/
+│
+├── data/
+│   ├── policies/           # Contains the .txt policy files
+│   └── raw/
+│       ├── policy_eval.csv # For task 4 evaluation
+│       └── agent_scenarios.csv # For running the 7 scenarios
+├── state/                  # Directory where checkpoint files are saved
+├── outputs/
+│   ├── agent_runs.jsonl    # Log of agent runs
+│   └── refund_ledger.jsonl # Ledger of issued/escalated refunds
+├── mock_llm.py             # Provided mock LLM module
+├── tools.py                # Tool definitions and TOOL_MAP (Task 5)
+└── agent.py                # RAG, ReAct loop, limits, and resume logic (Tasks 1-9)
+[8:23 pm, 3/11/2026] Pradeep: import sqlite3
+import json
+from datetime import datetime
+
+# TOOL_SPEC list required by the prompt description
+TOOL_SPEC = [
+    {
+        "name": "get_order",
+        "description": "Reads data/instanart.db and returns order details including status, order amount, and delivery minutes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string"}
+            },
+            "required": ["order_id"]
+        }
+    },
+    {
+        "name": "search_policy",
+        "description": "Returns your retrieval output under the key results.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required"…
+[8:24 pm, 3/11/2026] Pradeep: import os
+import glob
+import json
+import time
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import mock_llm
+from tools import TOOL_MAP
+
+# Global cache for chunks and vectorizer
+CHUNKS_CACHE = []
+VECTORIZER = None
+TFIDF_MATRIX = None
+
+# --- Task 1: Chunking ---
+def load_and_chunk_documents():
+    global CHUNKS_CACHE, VECTORIZER, TFIDF_MATRIX
+    if CHUNKS_CACHE:
+        return CHUNKS_CACHE
+    
+    chunks = []
+    filepaths = sorted(glob.glob("data/policies/*.txt"))
+    for fp in filepaths:
+        source_name = os.path.basename(fp)
+        with open(fp, "r", encoding="utf-8") as f:
+            text = f.read()
+        
+        words = text.split()
+        chunk_size = 40
+        overlap = 10
+        step = chunk_size - overlap
+        
+        for i in range(0, len(words), step):
+            chunk_words = words[i:i + chunk_size]
+            chunk_text = " ".join(chunk_words)
+            if chunk_text:
+                chunks.append({
+                    "source": source_name,
+                    "text": chunk_text
+                })
+    CHUNKS_CACHE = chunks
+    
+    # --- Task 2: Vectorisation and Retrieval ---
+    corpus = [c["text"] for c in chunks]
+    VECTORIZER = TfidfVectorizer()
+    TFIDF_MATRIX = VECTORIZER.fit_transform(corpus)
+    return chunks
+
+def retrieve_chunks_top3(query: str):
+    load_and_chunk_documents()
+    query_vec = VECTORIZER.transform([query])
+    scores = cosine_similarity(query_vec, TFIDF_MATRIX).flatten()
+    top_indices = scores.argsort()[::-1][:3]
+    
+    results = []
+    for idx in top_indices:
+        c = CHUNKS_CACHE[idx]
+        results.append(f"[source {c['source']}] {c['text']}")
+    return results
+
+# --- Task 3: Augment and Answer ---
+def augment_and_answer(query: str) -> str:
+    retrieved_chunks = retrieve_chunks_top3(query)
+    context_str = "\n".join(retrieved_chunks)
+    
+    messages = [
+        {"role": "system", "content": "POLICY ASSISTANT that instructs the model to answer only from the supplied context and to say it could not find the information otherwise."},
+        {"role": "user", "content": f"Context:\n{context_str}\n\nQuestion: {query}\nFormat: newline, the three chunks each prefixed with [source file name] on its own line, newline QUESTION: newline, the question. Return the model's text and the sources used."}
+    ]
+    response = mock_llm.chat(messages)
+    return response
+
+# --- Tasks 6, 7 & 8: ReAct Loop with Limits, Safeguards, and Checkpointing ---
+def run_agent(user_message: str, scenario_id: str, max_iterations=6, token_limit=6000, time_limit_seconds=10, resume_from_path=None):
+    start_time = time.monotonic()
+    tokens_used = 0
+    llm_calls = 0
+    
+    if resume_from_path and os.path.exists(resume_from_path):
+        with open(resume_from_path, "r") as f:
+            state = json.load(f)
+        messages = state["messages"]
+        step_counter = state["step_counter"]
+        tools_executed = state["tools_executed"]
+    else:
+        messages = [
+            {"role": "system", "content": "AGENT"},
+            {"role": "user", "content": user_message}
+        ]
+        step_counter = 0
+        tools_executed = []
+    
+    final_answer = None
+    status = "NOT_FOUND"
+    
+    for iteration in range(step_counter, max_iterations):
+        # Time limit check at top of iteration
+        if time.monotonic() - start_time > time_limit_seconds:
+            status = "FALLBACK_TIMEOUT"
+            final_answer = "Timeout limit reached."
+            break
+            
+        llm_calls += 1
+        response = mock_llm.chat(messages)
+        
+        # Estimate token usage update
+        current_tokens = len(str(messages)) + len(str(response))
+        tokens_used += current_tokens
+        
+        # Token limit check after model call
+        if tokens_used > token_limit:
+            status = "FALLBACK_TOKEN_LIMIT"
+            final_answer = "Token limit exceeded."
+            break
+            
+        # Parse assistant message format
+        # Expected format: "None, tool_calls: [{'id': '...', 'name': '...', 'arguments': ...}]" or final answer text
+        assistant_content = response.get("content", "None")
+        tool_calls = response.get("tool_calls", [])
+        
+        messages.append({
+            "role": "assistant",
+            "content": assistant_content,
+            "tool_calls": tool_calls
+        })
+        
+        if not tool_calls:
+            final_answer = assistant_content
+            status = "REFUND" # Or parsed status based on response
+            break
+            
+        # Execute tool calls
+        for tc in tool_calls:
+            t_name = tc.get("name")
+            t_args = tc.get("arguments", {})
+            t_id = tc.get("id")
+            
+            tools_executed.append(t_name)
+            
+            if t_name in TOOL_MAP:
+                tool_res = TOOL_MAP[t_name](**t_args)
+            else:
+                tool_res = {"error": "tool not found"}
+                
+            messages.append({
+                "role": "tool",
+                "tool_call_id": t_id,
+                "name": t_name,
+                "content": json.dumps(tool_res)
+            })
+            
+            # --- Task 8: Checkpointing after every tool observation ---
+            os.makedirs("state", exist_ok=True, mode=0o755)
+            checkpoint_data = {
+                "run_id": scenario_id,
+                "step_counter": iteration + 1,
+                "messages": messages,
+                "tools_executed": tools_executed,
+                "tokens_used": tokens_used
+            }
+            with open(f"state/{scenario_id}.json", "w") as cp_file:
+                json.dump(checkpoint_data, cp_file)
+                
+        # Simulate test crash right after second tool execution if requested
+        if scenario_id == "S1_crash_demo" and len(tools_executed) == 2:
+            raise RuntimeError("Simulated crash right after second tool execution!")
+
+    else:
+        status = "FALLBACK_MAX_ITERATIONS"
+        final_answer = "Max iterations reached without final answer."
+
+    # Log agent run output
+    os.makedirs("outputs", exist_ok=True, mode=0o755)
+    run_log = {
+        "scenario_id": scenario_id,
+        "status": status,
+        "final_answer": final_answer,
+        "llm_calls": llm_calls,
+        "tokens_used": tokens_used
+    }
+    with open("outputs/agent_runs.jsonl", "a") as f:
+        f.write(json.dumps(run_log) + "\n")
+        
+    return run_log
+from agent import load_and_chunk_documents, run_agent
+import os
+
+if _name_ == "_main_":
+    print("--- Initializing Policies and Chunks ---")
+    load_and_chunk_documents()
+    
+    print("--- Running Crash-and-Resume Demonstration for S1 ---")
+    scenario_id = "S1"
+    try:
+        run_agent("Process refund for order ORD123", scenario_id=scenario_id, resume_from_path=f"state/{scenario_id}.json")
+    except RuntimeError:
+        print("Caught simulated crash! Resuming execution...")
+        run_agent("Process refund for order ORD123", scenario_id=scenario_id, resume_from_path=f"state/{scenario_id}.json")
+        
+    print("Part D implementation tasks completed successfully!")
+
